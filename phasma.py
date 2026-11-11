@@ -262,41 +262,74 @@ def read_rtl_power_csv(path):
     return passes
 
 
-class FieldMeter:
-    """Baseline, peak hold and excursion detection over rtl_power passes.
+def chunk_key(low, step, count):
+    """Identity of one rtl_power tuner chunk: where it starts, its
+    bin step, and how many bins it carries."""
+    return (low, step, count)
 
-    The first pass is the room baseline. Every later bin reading above
-    baseline + threshold is an excursion and is logged as it is seen.
+
+def group_sweeps(passes):
+    """Group a flat list of rtl_power chunk lines into sweeps.
+
+    rtl_power writes one CSV line per tuner chunk, not per sweep: at
+    the default bin width an FM sweep is eight lines. A sweep is the
+    set of chunks covering the range once, in ascending order, so a
+    line whose chunk key already appears in the current sweep opens
+    the next sweep. Pass counts count sweeps, never lines.
+    """
+    sweeps = []
+    current = []
+    seen = set()
+    for low, step, powers in passes:
+        key = chunk_key(low, step, len(powers))
+        if key in seen:
+            sweeps.append(current)
+            current = []
+            seen = set()
+        current.append((low, step, powers))
+        seen.add(key)
+    if current:
+        sweeps.append(current)
+    return sweeps
+
+
+class FieldMeter:
+    """Baseline, peak hold and excursion detection over rtl_power sweeps.
+
+    rtl_power delivers a sweep as several chunk lines, and different
+    chunks cover different parts of the band with naturally different
+    levels. Baselines and peak hold are therefore kept per chunk,
+    keyed by (low, step, bin count): a bin is only ever compared
+    against the same bin of the same chunk from the first sweep.
+    Every later reading above its own chunk baseline + threshold is
+    an excursion and is logged as it is seen.
     """
 
     def __init__(self, session, threshold_db=6.0):
         self.session = session
         self.threshold = threshold_db
-        self.baseline = None
-        self.peak = None
-        self.peak_freq = None
+        self.baselines = {}
+        self.peaks = {}
         self.excursions = 0
 
-    def feed(self, low, step, powers, pass_number):
-        if self.baseline is None:
-            self.baseline = list(powers)
-            self.peak = list(powers)
+    def feed(self, low, step, powers, sweep_number):
+        key = chunk_key(low, step, len(powers))
+        if key not in self.baselines:
+            self.baselines[key] = list(powers)
+            self.peaks[key] = list(powers)
             self.session.log(
-                "FIELD", "baseline taken: %d bins from %.3f MHz, "
+                "FIELD", "baseline taken: chunk %.3f-%.3f MHz, %d bins, "
                 "median %.1f dB, strongest %.1f dB"
-                % (len(powers), low / 1e6,
-                   statistics.median(powers), max(powers)))
+                % (low / 1e6, (low + step * len(powers)) / 1e6,
+                   len(powers), statistics.median(powers), max(powers)))
             return
-        if len(powers) != len(self.baseline):
-            self.session.log("FIELD", "pass %d has %d bins, baseline has "
-                             "%d; pass skipped" % (pass_number, len(powers),
-                                                   len(self.baseline)))
-            return
+        baseline = self.baselines[key]
+        peak = self.peaks[key]
         strongest = None
         for idx, power in enumerate(powers):
-            if power > self.peak[idx]:
-                self.peak[idx] = power
-            delta = power - self.baseline[idx]
+            if power > peak[idx]:
+                peak[idx] = power
+            delta = power - baseline[idx]
             if delta >= self.threshold:
                 freq = low + idx * step
                 self.excursions += 1
@@ -308,9 +341,9 @@ class FieldMeter:
                     strongest = (delta, freq, power)
         if strongest is not None:
             self.session.log(
-                "FIELD", "pass %d strongest excursion %+.1f dB at "
+                "FIELD", "sweep %d strongest excursion %+.1f dB at "
                 "%.4f MHz (%.1f dB)"
-                % (pass_number, strongest[0], strongest[1] / 1e6,
+                % (sweep_number, strongest[0], strongest[1] / 1e6,
                    strongest[2]))
 
     def display(self, low, step, powers):
@@ -324,13 +357,13 @@ class FieldMeter:
                             (low + step * len(powers)) / 1e6, text))
 
     def summary(self):
-        if self.baseline is None:
+        if not self.baselines:
             self.session.log("FIELD", "no sweep data was collected")
             return
-        idx = max(range(len(self.peak)), key=lambda i: self.peak[i])
+        peak = max(max(powers) for powers in self.peaks.values())
         self.session.log(
             "FIELD", "peak hold %.1f dB; %d excursions over threshold "
-            "logged" % (self.peak[idx], self.excursions))
+            "logged" % (peak, self.excursions))
 
 
 def cmd_field(args):
@@ -375,9 +408,13 @@ def cmd_field(args):
         if not passes:
             session.log("ERROR", "rtl_power produced no data")
             return 2
-    for number, (low, step, powers) in enumerate(passes, start=1):
-        meter.feed(low, step, powers, number)
-        meter.display(low, step, powers)
+    sweeps = group_sweeps(passes)
+    session.log("FIELD", "%d rtl_power lines grouped into %d sweeps"
+                % (len(passes), len(sweeps)))
+    for number, sweep in enumerate(sweeps, start=1):
+        for low, step, powers in sweep:
+            meter.feed(low, step, powers, number)
+            meter.display(low, step, powers)
     meter.summary()
     session.log("SESSION", "field meter finished; files in %s" % session.dir)
     return 0

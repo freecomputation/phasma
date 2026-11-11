@@ -50,7 +50,7 @@ class FieldMeterTest(unittest.TestCase):
             self.assertEqual(meter.excursions, 0)
             meter.feed(88e6, 125e3, [-45.0, -30.0, -44.0], 2)
             self.assertEqual(meter.excursions, 1)
-            self.assertEqual(meter.peak[1], -30.0)
+            self.assertEqual(meter.peaks[(88e6, 125e3, 3)][1], -30.0)
             with open(session.log_path) as fh:
                 log = fh.read()
             self.assertIn("EXCURSION", log)
@@ -63,6 +63,88 @@ class FieldMeterTest(unittest.TestCase):
             meter.feed(88e6, 125e3, [-45.0, -45.5], 1)
             meter.feed(88e6, 125e3, [-44.8, -45.2], 2)
             self.assertEqual(meter.excursions, 0)
+
+
+class ChunkBaselineTest(unittest.TestCase):
+    """Defect 2: one rtl_power line is one tuner chunk, not a sweep.
+
+    Chunk A covers 88.0-88.5 MHz, chunk B 88.5-89.0 MHz. The two
+    chunks have naturally different levels; comparing B against A's
+    baseline (the old behavior) manufactures excursions out of an
+    unchanged band.
+    """
+
+    A = (88_000_000.0, 125_000.0)
+    B = (88_500_000.0, 125_000.0)
+
+    def _feed_sweep(self, meter, sweep_number, a_powers, b_powers):
+        meter.feed(self.A[0], self.A[1], a_powers, sweep_number)
+        meter.feed(self.B[0], self.B[1], b_powers, sweep_number)
+
+    def test_unchanged_chunks_log_no_excursion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = make_session(tmp)
+            meter = phasma.FieldMeter(session, threshold_db=6.0)
+            # B sits 7 dB hotter than A in both sweeps, unchanged.
+            self._feed_sweep(meter, 1, [-45.0] * 4, [-38.0] * 4)
+            self._feed_sweep(meter, 2, [-45.0] * 4, [-38.0] * 4)
+            self.assertEqual(meter.excursions, 0)
+            self.assertEqual(len(meter.baselines), 2)
+
+    def test_excursion_compares_against_own_chunk_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = make_session(tmp)
+            meter = phasma.FieldMeter(session, threshold_db=6.0)
+            self._feed_sweep(meter, 1, [-45.0] * 4, [-45.0] * 4)
+            spiked_b = [-45.0, -45.0, -35.0, -45.0]
+            self._feed_sweep(meter, 2, [-45.0] * 4, spiked_b)
+            self.assertEqual(meter.excursions, 1)
+            with open(session.log_path) as fh:
+                log = fh.read()
+            self.assertIn("88.7500 MHz", log)  # B low + 2 bins
+            self.assertIn("sweep 2", log)
+
+    def test_group_sweeps_counts_sweeps_not_lines(self):
+        one_sweep = [(88_000_000.0, 125_000.0, [-45.0] * 4),
+                     (88_500_000.0, 125_000.0, [-44.0] * 4)]
+        passes = one_sweep * 3
+        sweeps = phasma.group_sweeps(passes)
+        self.assertEqual(len(sweeps), 3)
+        for sweep in sweeps:
+            self.assertEqual(len(sweep), 2)
+
+    def test_field_simulate_multichunk_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = []
+
+            def row(low, powers):
+                step = 125000
+                cells = ["2026-11-10", "23:00:00", str(int(low)),
+                         str(int(low + step * len(powers))), str(step),
+                         "12"] + ["%.1f" % p for p in powers]
+                lines.append(", ".join(cells))
+
+            for sweep in range(2):
+                a = [-45.0] * 4
+                if sweep == 1:
+                    a[1] = -20.0      # one real excursion, in chunk A
+                row(88_000_000, a)
+                row(88_500_000, [-38.0] * 4)   # hotter chunk, unchanged
+            csv_path = os.path.join(tmp, "multi.csv")
+            with open(csv_path, "w") as fh:
+                fh.write("\n".join(lines) + "\n")
+            args = FakeArgs()
+            args.home = tmp
+            args.simulate = csv_path
+            args.threshold = 6.0
+            self.assertEqual(phasma.cmd_field(args), 0)
+            session_dirs = os.listdir(os.path.join(tmp, "sessions"))
+            sdir = os.path.join(tmp, "sessions", session_dirs[0])
+            with open(os.path.join(sdir, "session.log")) as fh:
+                log = fh.read()
+            self.assertIn("4 rtl_power lines grouped into 2 sweeps", log)
+            self.assertEqual(log.count("EXCURSION"), 1)
+            self.assertIn("88.1250 MHz", log)
 
 
 class AudioTest(unittest.TestCase):
