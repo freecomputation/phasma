@@ -34,10 +34,13 @@ Exit codes: 0 ok, 2 a required tool is missing, 3 the tuner is busy.
 
 import argparse
 import array
+import io
 import math
 import os
 import random
+import select
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -45,7 +48,7 @@ import time
 import wave
 from datetime import datetime
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 FM_LOW, FM_HIGH, FM_STEP = 88_000_000, 108_000_000, 200_000
 AIR_LOW, AIR_HIGH, AIR_STEP = 118_000_000, 137_000_000, 25_000
@@ -354,7 +357,19 @@ def cmd_field(args):
                    "-i", str(args.interval), "-e", str(args.seconds),
                    "-g", str(args.gain), csv_path]
         session.log("FIELD", "running %s" % " ".join(command))
-        subprocess.run(command, check=False)
+        proc = _spawn(command)
+        try:
+            # rtl_power ends itself at -e seconds; the grace beyond it
+            # and the group cleanup cover a hang or a Ctrl+C, so no
+            # rtl_power child is ever left holding the tuner.
+            proc.wait(timeout=args.seconds + 60)
+        except subprocess.TimeoutExpired:
+            session.log("FIELD", "rtl_power ran past its limit and was "
+                        "stopped")
+            _stop_process_group(proc)
+        except KeyboardInterrupt:
+            _stop_process_group(proc)
+            raise
         passes = read_rtl_power_csv(csv_path) \
             if os.path.exists(csv_path) else []
         if not passes:
@@ -406,12 +421,105 @@ class WordLayer:
                 self.cooldown = 3
 
 
-def _read_exactly(stream, count):
+def _spawn(command, **kwargs):
+    """Popen a child in its own process group (its own session).
+
+    Every receiver or player child runs in a separate group so that
+    cleanup can terminate the whole group - the child and anything it
+    spawned - and never leave an orphan holding the tuner or a pipe.
+    """
+    kwargs.setdefault("start_new_session", True)
+    return subprocess.Popen(command, **kwargs)
+
+
+def _stop_process_group(proc, grace=2.0):
+    """Terminate a child's whole process group and reap the child.
+
+    SIGTERM first, SIGKILL after the grace period. Safe to call on a
+    child that already exited, and safe to call twice.
+    """
+    if proc is None:
+        return
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+    try:
+        proc.wait(timeout=grace)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _stop_player(player):
+    """Close a player's stdin and stop its process group."""
+    if player is None:
+        return
+    try:
+        if player.stdin is not None:
+            player.stdin.close()
+    except OSError:
+        pass
+    _stop_process_group(player)
+
+
+def _read_exactly(stream, count, deadline=None):
+    """Read up to count bytes from a pipe, returning what arrived.
+
+    Returns early at EOF, and - when deadline (a time.time() value)
+    is given - as soon as the deadline passes, even if the writer is
+    alive but silent. A squelched rtl_fm on a quiet band emits no
+    bytes at all; an unbounded read there once held the tuner for
+    169 seconds on a 30-second run. Reads go through os.read on the
+    raw descriptor after a select wait, because a buffered read
+    would block trying to fill the whole request.
+    """
     data = b""
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, io.UnsupportedOperation):
+        fd = None
     while len(data) < count:
-        chunk = stream.read(count - len(data))
-        if not chunk:
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            wait = remaining
+        else:
+            wait = None
+        if fd is None:
+            chunk = stream.read(count - len(data))
+            if not chunk:
+                break
+            data += chunk
+            continue
+        try:
+            ready, _, _ = select.select([fd], [], [], wait)
+        except (OSError, ValueError):
             break
+        if not ready:
+            break  # deadline passed with no bytes
+        try:
+            chunk = os.read(fd, count - len(data))
+        except BlockingIOError:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            break  # EOF
         data += chunk
     return data
 
@@ -429,7 +537,7 @@ def spirit_fm_live(session, args, words):
     if args.play:
         aplay = shutil.which("aplay")
         if aplay:
-            player = subprocess.Popen(
+            player = _spawn(
                 [aplay, "-r", str(FM_RATE), "-f", "S16_LE", "-t", "raw",
                  "-c", "1"], stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -439,22 +547,27 @@ def spirit_fm_live(session, args, words):
     all_samples = array.array("h")
     deadline = time.time() + args.seconds
     pass_number = 0
+    proc = None
     try:
         while time.time() < deadline:
             pass_number += 1
             levels = []
             freq = FM_LOW
             while freq <= FM_HIGH and time.time() < deadline:
-                proc = subprocess.Popen(
+                proc = _spawn(
                     [tool, "-f", str(freq), "-M", "wbfm",
                      "-g", str(args.gain), "-"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                data = _read_exactly(proc.stdout, window_bytes)
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                # A hop normally fills its window in about a second of
+                # rtl_fm startup plus the dwell; the deadline keeps a
+                # starved hop from hanging the sweep or the run.
+                step_deadline = min(
+                    deadline,
+                    time.time() + args.dwell / 1000.0 + 10.0)
+                data = _read_exactly(proc.stdout, window_bytes,
+                                     deadline=step_deadline)
+                _stop_process_group(proc)
+                proc = None
                 samples = array.array("h")
                 samples.frombytes(data[: len(data) - len(data) % 2])
                 if sys.byteorder == "big":
@@ -464,6 +577,7 @@ def spirit_fm_live(session, args, words):
                     try:
                         player.stdin.write(data)
                     except (BrokenPipeError, OSError):
+                        _stop_player(player)
                         player = None
                 levels.append((freq, rms_dbfs(samples)))
                 freq += FM_STEP
@@ -473,11 +587,8 @@ def spirit_fm_live(session, args, words):
             sweep_display(session, levels)
             words.consider_pass(levels, lambda f: "%.1f MHz" % (f / 1e6))
     finally:
-        if player is not None:
-            try:
-                player.stdin.close()
-            except OSError:
-                pass
+        _stop_process_group(proc)
+        _stop_player(player)
     write_wav(session.path("spirit.wav"), FM_RATE, all_samples)
     return len(all_samples) / FM_RATE
 
@@ -497,13 +608,13 @@ def spirit_airband_live(session, args, words):
                "-l", str(args.squelch), "-g", str(args.gain), "-"]
     session.log("SPIRIT", "airband scan: %s (dwell is signal-driven; "
                 "squelch is in rtl_fm units)" % " ".join(command))
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL)
+    proc = _spawn(command, stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL)
     player = None
     if args.play:
         aplay = shutil.which("aplay")
         if aplay:
-            player = subprocess.Popen(
+            player = _spawn(
                 [aplay, "-r", str(AIR_RATE), "-f", "S16_LE", "-t", "raw",
                  "-c", "1"], stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -512,7 +623,11 @@ def spirit_airband_live(session, args, words):
     window_number = 0
     try:
         while time.time() < deadline:
-            data = _read_exactly(proc.stdout, window_bytes)
+            # The read carries the run's deadline: on a quiet band the
+            # squelch emits no bytes, and the run must still end on
+            # time instead of blocking on the pipe forever.
+            data = _read_exactly(proc.stdout, window_bytes,
+                                 deadline=deadline)
             if not data:
                 break
             samples = array.array("h")
@@ -524,6 +639,7 @@ def spirit_airband_live(session, args, words):
                 try:
                     player.stdin.write(data)
                 except (BrokenPipeError, OSError):
+                    _stop_player(player)
                     player = None
             window_number += 1
             level = rms_dbfs(samples)
@@ -531,12 +647,12 @@ def spirit_airband_live(session, args, words):
                         % (window_number, level))
             words.consider_pass([(0, level)], lambda f: "airband scan")
     finally:
-        proc.terminate()
-        if player is not None:
-            try:
-                player.stdin.close()
-            except OSError:
-                pass
+        _stop_process_group(proc)
+        _stop_player(player)
+    if window_number == 0:
+        session.log("SPIRIT", "airband scan ended on time with zero "
+                    "windows measured: the band was quiet and the "
+                    "squelch emitted no audio")
     write_wav(session.path("spirit.wav"), AIR_RATE, all_samples)
     return len(all_samples) / AIR_RATE
 
