@@ -9,8 +9,10 @@ import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 import wave
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import phasma
@@ -197,6 +199,98 @@ class SimulatePipelinesTest(unittest.TestCase):
             self.assertIn("simulate mode", log)
             self.assertIn("WORD", log)          # the loud window fired
             self.assertIn("not a measurement", log)
+
+
+class DeadlineReadTest(unittest.TestCase):
+    """Defect 1: a silent child must never block a read past its run."""
+
+    def test_starved_pipe_ends_at_deadline(self):
+        proc = phasma._spawn(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=phasma.subprocess.PIPE)
+        try:
+            start = time.monotonic()
+            data = phasma._read_exactly(
+                proc.stdout, 4096, deadline=time.time() + 1.0)
+            elapsed = time.monotonic() - start
+            self.assertEqual(data, b"")
+            self.assertLess(elapsed, 5.0)
+        finally:
+            phasma._stop_process_group(proc)
+        self.assertIsNotNone(proc.poll())
+
+    def test_partial_data_returned_at_deadline(self):
+        proc = phasma._spawn(
+            [sys.executable, "-c",
+             "import sys, time; sys.stdout.buffer.write(b'abcd');"
+             " sys.stdout.buffer.flush(); time.sleep(30)"],
+            stdout=phasma.subprocess.PIPE)
+        try:
+            start = time.monotonic()
+            data = phasma._read_exactly(
+                proc.stdout, 16, deadline=time.time() + 1.2)
+            elapsed = time.monotonic() - start
+            self.assertEqual(data, b"abcd")
+            self.assertLess(elapsed, 6.0)
+        finally:
+            phasma._stop_process_group(proc)
+
+    def test_stop_process_group_kills_children(self):
+        proc = phasma._spawn(["sh", "-c", "sleep 47 & wait"])
+        time.sleep(0.3)
+        phasma._stop_process_group(proc)
+        self.assertIsNotNone(proc.poll())
+        leftovers = [cmd for _, cmd in phasma.read_cmdlines()
+                     if "sleep 47" in cmd]
+        self.assertEqual(leftovers, [])
+
+
+class AirbandQuietBandTest(unittest.TestCase):
+    """Defect 1 end to end: a fake rtl_fm that emits nothing at all.
+
+    The squelch on a quiet band produces exactly this - a live child
+    and a silent pipe. The run must end on time, close its session
+    cleanly with zero windows, and leave no process behind.
+    """
+
+    def test_quiet_band_ends_on_time_with_no_orphans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            fake = os.path.join(bindir, "rtl_fm")
+            with open(fake, "w") as fh:
+                fh.write("#!/bin/sh\nexec sleep 43\n")
+            os.chmod(fake, 0o755)
+            args = FakeArgs()
+            args.home = tmp
+            args.simulate = None
+            args.band = "airband"
+            args.dwell = 250
+            args.seconds = 2
+            args.gain = 35
+            args.squelch = 20
+            args.play = False
+            path = os.environ.get("PATH", "")
+            with mock.patch.dict(os.environ,
+                                 {"PATH": bindir + os.pathsep + path}):
+                start = time.monotonic()
+                result = phasma.cmd_spirit(args)
+                elapsed = time.monotonic() - start
+            self.assertEqual(result, 0)
+            self.assertLess(elapsed, 15.0)
+            session_dirs = os.listdir(os.path.join(tmp, "sessions"))
+            self.assertEqual(len(session_dirs), 1)
+            sdir = os.path.join(tmp, "sessions", session_dirs[0])
+            with open(os.path.join(sdir, "session.log")) as fh:
+                log = fh.read()
+            self.assertIn("zero windows", log)
+            self.assertIn("spirit box finished", log)
+            with wave.open(os.path.join(sdir, "spirit.wav"), "rb") as wav:
+                self.assertEqual(wav.getnframes(), 0)
+                self.assertEqual(wav.getframerate(), phasma.AIR_RATE)
+            leftovers = [cmd for _, cmd in phasma.read_cmdlines()
+                         if "sleep 43" in cmd]
+            self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":
